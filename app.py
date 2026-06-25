@@ -135,9 +135,13 @@ def build_pivot_sheet(ws, final_rows, headers, today_str):
     PIVOT_YEL  = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
     PIVOT_BLUE = PatternFill(start_color='BDD7EE', end_color='BDD7EE', fill_type='solid')
 
-    # Clear
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
+    # Clear based on current sheet dimensions (captures any ghost rows/cols from prior writes)
+    old_max_row = ws.max_row or 1
+    old_max_col = ws.max_column or 1
+    clear_rows  = max(old_max_row, len(statuses) + 5)
+    clear_cols  = max(old_max_col, len(col_dates) + 5)
+    for r in range(1, clear_rows + 1):
+        for c in range(1, clear_cols + 1):
             cell = ws.cell(r, c)
             cell.value  = None
             cell.fill   = PatternFill()
@@ -429,79 +433,87 @@ def update_not_pushed(wb_bytes, invoice_inputs, wms_status='PENDING_FULFILLMENT'
     wb        = load_workbook(BytesIO(wb_bytes))
     today_str = datetime.today().strftime('%Y-%m-%d')
 
-    invoices = {str(i).strip().upper() for i in invoice_inputs if str(i).strip()}
+    invoices    = {str(i).strip().upper() for i in invoice_inputs if str(i).strip()}
+    NUM_COLS    = 8   # all 8-col sheets have exactly this many data columns
+    WMS_COL_IDX = 8   # 1-based index of WMS column
 
-    DISPLAY_COLS = ['Order Number', 'Invoice Number', 'Payment Status',
-                    'Order Item Status', 'Ordered Date', 'Nickname', 'MP SLA', 'WMS']
-    WMS_COL_IDX  = 8  # 1-based
-
-    def read_sheet_rows(ws):
-        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    def read_8col_rows(ws):
+        """Read header + data rows from an 8-column sheet reliably."""
+        headers = [ws.cell(1, c).value for c in range(1, NUM_COLS + 1)]
         rows = []
         for r in range(2, ws.max_row + 1):
-            rv = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+            rv = [ws.cell(r, c).value for c in range(1, NUM_COLS + 1)]
             if any(v is not None for v in rv):
                 rows.append(rv)
         return headers, rows
 
-    def write_sheet_rows(ws, rows, headers):
-        """Clear data rows and rewrite."""
-        for r in range(2, ws.max_row + 1):
-            for c in range(1, ws.max_column + 1):
-                cell       = ws.cell(r, c)
-                cell.value = None
-                cell.fill  = PatternFill()
-                cell.font  = BODY_FONT
-                cell.border = BORDER
+    def clear_and_rewrite(ws, rows):
+        """
+        Clear ALL existing data rows (up to a safe ceiling), then write new rows.
+        Never touches row 1 (header). Uses a ceiling well above expected row count
+        to catch any leftover ghost rows from previous writes.
+        """
+        clear_ceiling = max(ws.max_row, len(rows) + 10)
+        for r in range(2, clear_ceiling + 1):
+            for c in range(1, NUM_COLS + 1):
+                cell        = ws.cell(r, c)
+                cell.value  = None
+                cell.fill   = PatternFill()
+                cell.font   = BODY_FONT
+                cell.border = Border()  # remove border too so ghost rows are invisible
+
+        nick_idx = 5  # 0-based index of Nickname in 8-col rows
         for i, rv in enumerate(rows, 1):
-            nick    = rv[headers.index('Nickname')] if 'Nickname' in headers else ''
-            wms_val = rv[headers.index('WMS')]      if 'WMS' in headers else None
+            nick    = rv[nick_idx] if len(rv) > nick_idx else ''
+            wms_val = rv[WMS_COL_IDX - 1] if len(rv) >= WMS_COL_IDX else None
             rf      = get_row_fill(nick, i)
             apply_row_ws(ws, i + 1, rv, rf, WMS_COL_IDX, wms_val)
 
     # 1. Read FILTERED DATA
-    ws_fd       = wb['FILTERED DATA']
-    fd_headers, fd_rows = read_sheet_rows(ws_fd)
+    ws_fd               = wb['FILTERED DATA']
+    fd_headers, fd_rows = read_8col_rows(ws_fd)
 
-    # 2. Read NOT PUSHED — separate matched vs kept
-    ws_np       = wb['NOT PUSHED']
-    np_headers, np_rows = read_sheet_rows(ws_np)
-    inv_col_np  = np_headers.index('Invoice Number')
+    # 2. Read NOT PUSHED — split into matched vs kept
+    ws_np               = wb['NOT PUSHED']
+    np_headers, np_rows = read_8col_rows(ws_np)
+    inv_col_np          = np_headers.index('Invoice Number')
 
     matched_rows, kept_np_rows = [], []
+    matched_invoices = set()
     for rv in np_rows:
         inv_val = str(rv[inv_col_np] or '').strip().upper()
         if inv_val in invoices:
-            updated    = list(rv[:WMS_COL_IDX - 1]) + [wms_status]
+            updated = list(rv[:WMS_COL_IDX - 1]) + [wms_status]
             matched_rows.append(updated)
+            matched_invoices.add(inv_val)
         else:
             kept_np_rows.append(rv)
 
-    # 3. Read CLOSE & NOT FOUND — remove matched
-    ws_cnf        = wb['CLOSE & NOT FOUND']
-    cnf_headers, cnf_rows = read_sheet_rows(ws_cnf)
-    inv_col_cnf   = cnf_headers.index('Invoice Number')
-    kept_cnf_rows = [rv for rv in cnf_rows
-                     if str(rv[inv_col_cnf] or '').strip().upper() not in invoices]
+    # 3. Read CLOSE & NOT FOUND — remove matched invoices
+    ws_cnf                  = wb['CLOSE & NOT FOUND']
+    cnf_headers, cnf_rows   = read_8col_rows(ws_cnf)
+    inv_col_cnf             = cnf_headers.index('Invoice Number')
+    kept_cnf_rows           = [
+        rv for rv in cnf_rows
+        if str(rv[inv_col_cnf] or '').strip().upper() not in invoices
+    ]
 
-    # 4. Append matched rows to FILTERED DATA
+    # 4. Build final FILTERED DATA rows
     final_fd_rows = fd_rows + matched_rows
 
-    # 5. Rewrite all sheets
-    write_sheet_rows(ws_fd,  final_fd_rows, fd_headers)
-    write_sheet_rows(ws_np,  kept_np_rows,  np_headers)
-    write_sheet_rows(ws_cnf, kept_cnf_rows, cnf_headers)
+    # 5. Rewrite only the three 8-col sheets that changed
+    clear_and_rewrite(ws_fd,  final_fd_rows)
+    clear_and_rewrite(ws_np,  kept_np_rows)
+    clear_and_rewrite(ws_cnf, kept_cnf_rows)
 
-    # 6. Rebuild PIVOT
+    # 6. Rebuild PIVOT (PARTIAL, ORIGINAL, RMA are untouched)
     ws_piv = wb['PIVOT']
     build_pivot_sheet(ws_piv, final_fd_rows, fd_headers, today_str)
 
     out = BytesIO()
     wb.save(out)
     out.seek(0)
-    return out.read(), len(matched_rows), invoices - {
-        str(r[inv_col_np]).strip().upper() for r in matched_rows
-    }
+    return out.read(), len(matched_rows), invoices - matched_invoices
 
 
 # ─── STREAMLIT UI ────────────────────────────────────────────────────────────
